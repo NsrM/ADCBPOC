@@ -207,6 +207,17 @@ public class DynamoAttributeParser {
         return result;
     }
 
+    /**
+     * Converts DynamoDB item → Map<String, Object>
+     */
+    public static Map<String, Object> parseItem(
+            Map<String, AttributeValue> item) {
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        item.forEach((k, v) -> result.put(k, parse(v)));
+        return result;
+    }
+
 
 
 }

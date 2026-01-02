@@ -1,12 +1,10 @@
 package org.example.controller;
 
 import org.example.model.CoreBankingTransactions;
+import org.example.repository.DynamoWriteRepository;
 import org.example.service.CoreBankingService;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 
 import java.util.Map;
 
@@ -16,8 +14,11 @@ public class CoreBankingController {
 
     private final CoreBankingService service;
 
-    public CoreBankingController(CoreBankingService service) {
+    private final DynamoWriteRepository dynamoWriteRepository;
+
+    public CoreBankingController(CoreBankingService service, DynamoWriteRepository dynamoWriteRepository) {
         this.service = service;
+        this.dynamoWriteRepository = dynamoWriteRepository;
     }
 
     @GetMapping("/accounts/{accountNo}")
@@ -46,5 +47,16 @@ public class CoreBankingController {
         }
 
         return ResponseEntity.ok(customerInfo);
+    }
+
+    @PostMapping("/customers/{cif}")
+    public ResponseEntity<?> insert(
+            @PathVariable String cif,
+            @RequestBody Map<String, Object> payload) {
+
+        Map<String, Object> response =
+                dynamoWriteRepository.putItem(cif, payload);
+
+        return ResponseEntity.ok(response);
     }
 }
