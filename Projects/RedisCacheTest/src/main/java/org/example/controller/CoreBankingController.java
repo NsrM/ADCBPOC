@@ -49,6 +49,7 @@ public class CoreBankingController {
         return ResponseEntity.ok(customerInfo);
     }
 
+    // Controller for generic record insertion
     @PostMapping("/customers/{cif}")
     public ResponseEntity<?> insert(
             @PathVariable String cif,

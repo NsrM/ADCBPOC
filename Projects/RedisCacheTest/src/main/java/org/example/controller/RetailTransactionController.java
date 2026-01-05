@@ -1,12 +1,10 @@
 package org.example.controller;
 
+import org.example.model.RetailTransactionDTO;
 import org.example.service.RetailTransactionService;
 import org.example.util.DynamoAttributeParser;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 
 import java.util.HashMap;
@@ -80,6 +78,14 @@ public class RetailTransactionController {
                 });
         // Can try below else also instead of transaction null for cleaner rest semantics
         // .orElse(ResponseEntity.noContent().build());
+    }
+
+    @PostMapping("/upsert")
+    public ResponseEntity<String> upsertTransaction(
+            @RequestBody RetailTransactionDTO request) {
+
+        service.upsertTransaction(request);
+        return ResponseEntity.ok("Transaction upserted successfully");
     }
 }
 
