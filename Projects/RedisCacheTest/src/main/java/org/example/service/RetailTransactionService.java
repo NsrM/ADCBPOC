@@ -86,40 +86,67 @@ public class RetailTransactionService {
     }
 
     public void upsertTransaction(RetailTransactionDTO request) {
+        // *****This below style of code for upsert has a problem: It results in exception
+        // The document path provided in the update expression is invalid for update (Service: DynamoDb, Status Code: 400, Request ID: 5T5C904K679JCQ5JHKMHS7ECERVV4KQNSO5AEMVJF66Q9ASUAAJG)
+        // Reason: DynamoDB cannot update a child attribute if the parent map doesn’t exist.
+        // For a new item transaction is not already existent under which amount , currency other fields are present*****
+//
+//        String pk =  request.getCif();
+//        String sk = request.getTxnTimestamp();
+//
+//        Map<String, AttributeValue> key = Map.of(
+//                "cif", AttributeValue.fromS(pk), // primary key
+//                "txnTimestamp", AttributeValue.fromS(sk) // sort key
+//        );
+//
+//        Map<String, AttributeValue> values = new HashMap<>();
+//        values.put(":amount", AttributeValue.fromN(request.getAmount().toString()));
+//        values.put(":currency", AttributeValue.fromS(request.getCurrency()));
+//        values.put(":type", AttributeValue.fromS(request.getTxnType()));
+//        values.put(":status", AttributeValue.fromS(request.getStatus()));
+//        //values.put(":updatedAt", AttributeValue.fromN(String.valueOf(System.currentTimeMillis())));
+//
+//        UpdateItemRequest updateRequest = UpdateItemRequest.builder()
+//                .tableName(TABLE_NAME)
+//                .key(key)
+//                .updateExpression("""
+//                    SET #txn.amount = :amount,
+//                        #txn.currency = :currency,
+//                        #txn.#t = :type,
+//                        #txn.#s = :status
+//                """)
+//                .expressionAttributeNames(Map.of(
+//                        "#t", "txnType",
+//                        "#s", "status",
+//                        "#txn","transaction"
+//                ))
+//                .expressionAttributeValues(values)
+//                .build();
+//
+//        dynamoDbClient.updateItem(updateRequest);
 
-        String pk =  request.getCif();
-        String sk = request.getTxnTimestamp();
-
-        Map<String, AttributeValue> key = Map.of(
-                "cif", AttributeValue.fromS(pk), // primary key
-                "txnTimestamp", AttributeValue.fromS(sk) // sort key
-        );
-
-        Map<String, AttributeValue> values = new HashMap<>();
-        values.put(":amount", AttributeValue.fromN(request.getAmount().toString()));
-        values.put(":currency", AttributeValue.fromS(request.getCurrency()));
-        values.put(":type", AttributeValue.fromS(request.getTxnType()));
-        values.put(":status", AttributeValue.fromS(request.getStatus()));
-        //values.put(":updatedAt", AttributeValue.fromN(String.valueOf(System.currentTimeMillis())));
-
-        UpdateItemRequest updateRequest = UpdateItemRequest.builder()
+        UpdateItemRequest upsertRequest = UpdateItemRequest.builder()
                 .tableName(TABLE_NAME)
-                .key(key)
-                .updateExpression("""
-                    SET #txn.amount = :amount,
-                        #txn.currency = :currency,
-                        #txn.#t = :type,
-                        #txn.#s = :status
-                """)
-                .expressionAttributeNames(Map.of(
-                        "#t", "txnType",
-                        "#s", "status",
-                        "#txn","transaction"
+                .key(Map.of(
+                        "cif", AttributeValue.fromS(request.getCif()),
+                        "txnTimestamp", AttributeValue.fromS(request.getTxnTimestamp())
                 ))
-                .expressionAttributeValues(values)
+                .updateExpression("SET #txn = :txn")
+                .expressionAttributeNames(Map.of(
+                        "#txn", "transaction"
+                ))
+                .expressionAttributeValues(Map.of(
+                        ":txn", AttributeValue.fromM(Map.of(
+                                "amount", AttributeValue.fromN(request.getAmount().toString()),
+                                "currency", AttributeValue.fromS(request.getCurrency()),
+                                "status", AttributeValue.fromS(request.getStatus()),
+                                "txnId", AttributeValue.fromS(request.getTxnId()),
+                                "txnType", AttributeValue.fromS(request.getTxnType())
+                        ))
+                ))
                 .build();
+        dynamoDbClient.updateItem(upsertRequest);
 
-        dynamoDbClient.updateItem(updateRequest);
     }
 
 

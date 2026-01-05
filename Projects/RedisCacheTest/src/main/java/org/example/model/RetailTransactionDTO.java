@@ -9,7 +9,7 @@ public class RetailTransactionDTO {
 
     private String accountId;
     private String cif;
-    private String transactionId;
+    private String txnId;
 
     private BigDecimal amount;
     private String currency;
