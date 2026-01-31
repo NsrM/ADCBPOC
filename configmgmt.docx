@@ -1,0 +1,253 @@
+MIB 2.0 Common Configuration & Master Data Synchronization Engine
+Updated Jan 22
+•	 
+Edit
+Share
+MIB 2.0 Common Configuration & Master Data Synchronization Engine
+ 
+By Saranjeet Bepari
+5 min
+3
+Add a reaction
+ Page Classification
+Implementation Guide: Distributed Master Data & Configuration Caching
+Version: 1.0 (Generic Platform Service)
+Target Audience: Platform Engineers, Backend Developers
+Scope: Implementation of the Async Transactional Outbox (Delta Sync) Engine for all static/semi-static configuration data across the MIB Banking Platform.
+1. Architecture Overview
+To support high-performance access to Master Data (Country Codes, Messages) and Configurations (Feature Flags, Policies) without database bottlenecks, we implement a Leader-Only Write / Multi-Level Read architecture.
+●        Pattern: Async Transactional Outbox (Delta Sync).
+●        Producer (Admin Service): A single Kubernetes Leader pod polls a central change log and pushes updates to Redis (L2). It supports Delta Sync (specific rows) and Full Sync (entire tables).
+●        Consumer (All Microservices): Services read from local JVM Caffeine cache (L1). On a miss, they read from Redis (L2).
+●        Synchronization: Redis Pub/Sub is used to invalidate L1 caches instantly when data changes.
+1.1 Design Principles
+●        Universal Registry: Any database table can be "cached" simply by adding a row to the cache_sync_registry. No code changes are required to onboard new master data.
+●        Decoupled Write/Read Paths (CQRS-Lite): The Admin Service handles all database load. Consuming services never query the configuration tables directly.
+●        Latency-First Access: Master data is accessed in microseconds via L1 memory, ensuring high throughput for validation and enrichment logic.
+●        Eventual Consistency: Updates propagate to all pods within seconds via the Redis Pub/Sub backplane.
+ 
+1.2 High level Flow Diagram
+ 
+2. Database Schema Design
+A. Meta-Configuration Registry (cache_sync_registry)
+This table acts as the "Control Plane".
+CREATE TABLE cache_sync_registry (
+    table_name VARCHAR(100) PRIMARY KEY, -- Source DB table (e.g., 'app_messages', 'country_master')
+    redis_prefix VARCHAR(50) NOT NULL,   -- Redis Namespace (e.g., 'msg', 'ref:country')
+    key_column VARCHAR(50) NOT NULL,     -- Column used as ID (e.g., 'msg_code', 'iso3')
+    value_columns VARCHAR(255) DEFAULT '*', -- Columns to sync (e.g., 'en_text, fr_text')
+    status VARCHAR(20) DEFAULT 'ACTIVE'  -- 'ACTIVE' or 'INACTIVE'
+);
+B. Change Log (config_change_log)
+This table captures the "Events" (Insert/Update/Delete) via triggers.
+CREATE TABLE config_change_log (
+    id BIGSERIAL PRIMARY KEY,
+    table_name VARCHAR(100) NOT NULL,
+    primary_key VARCHAR(255) NOT NULL, -- Value of the key_column. 'ALL' = Full Sync.
+    action_type VARCHAR(20) NOT NULL,  -- 'INSERT', 'UPDATE', 'DELETE', 'REFRESH'
+    status VARCHAR(20) DEFAULT 'PENDING', -- 'PENDING', 'COMPLETE', 'FAILED'
+    created_at TIMESTAMP DEFAULT NOW(),
+    processed_at TIMESTAMP
+);
+CREATE INDEX idx_pending_logs ON config_change_log(status, id);
+C. Change Capture Trigger
+Apply this trigger to every master table registered in cache_sync_registry.
+CREATE OR REPLACE FUNCTION capture_config_change() RETURNS TRIGGER AS $$
+BEGIN
+    IF (TG_OP = 'DELETE') THEN
+        INSERT INTO config_change_log (table_name, primary_key, action_type, status)
+        VALUES (TG_TABLE_NAME, OLD.msg_code, 'DELETE', 'PENDING'); -- Note: Adjust PK column name dynamically or use logic to find PK
+        RETURN OLD;
+    ELSE
+        INSERT INTO config_change_log (table_name, primary_key, action_type, status)
+        VALUES (TG_TABLE_NAME, NEW.msg_code, TG_OP, 'PENDING'); -- Note: Adjust PK column name
+        RETURN NEW;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+-- Example Application:
+CREATE TRIGGER trg_msg_change
+AFTER INSERT OR UPDATE OR DELETE ON app_messages
+FOR EACH ROW EXECUTE FUNCTION capture_config_change();
+3. Redis Data Model & Sample Entries
+This section illustrates how database rows are transformed into Redis Hash structures.
+A. Example: Application Messages
+Source DB Row (app_messages):
+●        msg_code: ERR_001
+●        en_text: System Error
+●        fr_text: Erreur Système
+Redis Entry:
+●        Key:msg:7654321 (where 7654321 is hash("ERR_001"))
+●        Type:HASH
+●        Fields: "msg_code": "ERR_001"
+"en_text": "System Error"
+"fr_text": "Erreur Système"
+B. Example: Country Master
+Source DB Row (country_master):
+●        iso_code: US
+●        name: United States
+●        dial_code: +1
+Redis Entry:
+●        Key:ref:country:12345 (where 12345 is hash("US"))
+●        Type:HASH
+●        Fields:iso_code, name, dial_code
+C. Pub/Sub Notification
+Channel:mib.config.updates (Generic Channel)
+Payload Examples:
+●        REFRESH:msg:7654321 (Single Message Update)
+●        REFRESH:ref:country:ALL (Full Table Reload)
+4. Producer Service Implementation (Admin Service)
+Class:LeaderConfigurationSyncService
+Responsibility: Runs on the Leader Pod only. Generic synchronization engine.
+Key Logic
+●        Async Processing: Uses CompletableFuture to process multiple tables in parallel.
+●        Dynamic SQL: Injects value_columns from metadata to optimize fetch size.
+@Service
+public class LeaderConfigurationSyncService {
+    @Scheduled(fixedDelayString = "${app.sync.interval:5000}")
+    public void deltaSync() {
+        if (!isLeader) return;
+        // 1. Fetch Pending Logs
+        List<ChangeLogEntry> changes = jdbcTemplate.query(
+            "SELECT * FROM config_change_log WHERE status = 'PENDING' ORDER BY id ASC LIMIT 200", 
+            new BeanPropertyRowMapper<>(ChangeLogEntry.class)
+        );
+        if (changes.isEmpty()) return;
+        // 2. Group by Table for Parallel Processing
+        Map<String, List<ChangeLogEntry>> byTable = changes.stream()
+            .collect(Collectors.groupingBy(ChangeLogEntry::getTableName));
+        // 3. Process Tables Asynchronously
+        List<CompletableFuture<Void>> futures = byTable.entrySet().stream()
+            .map(entry -> CompletableFuture.runAsync(() -> 
+                processTableChanges(entry.getKey(), entry.getValue()), executor))
+            .collect(Collectors.toList());
+        // 4. Wait for Completion & Update Status
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+            
+            List<Long> successIds = changes.stream().map(ChangeLogEntry::getId).toList();
+            jdbcTemplate.update("UPDATE config_change_log SET status='COMPLETE', processed_at=NOW() WHERE id IN (:ids)", successIds);
+        } catch (Exception e) {
+            log.error("Batch sync failed", e);
+        }
+    }
+    private void processTableChanges(String tableName, List<ChangeLogEntry> changes) {
+        // Fetch Metadata
+        SyncConfig meta = getMetadataForTable(tableName); 
+        
+        String columnsToFetch = (meta.getValueColumns() == null || meta.getValueColumns().isEmpty()) 
+                                ? "*" : meta.getValueColumns();
+        boolean fullRefresh = changes.stream().anyMatch(c -> "ALL".equals(c.getPrimaryKey()));
+        if (fullRefresh) {
+            // A. Full Sync Mode
+            syncData(meta, columnsToFetch, null); 
+            redisTemplate.convertAndSend("mib.config.updates", "REFRESH:" + meta.getPrefix() + ":ALL");
+        } else {
+            // B. Delta Sync Mode
+            Set<String> ids = changes.stream().map(ChangeLogEntry::getPrimaryKey).collect(Collectors.toSet());
+            
+            syncData(meta, columnsToFetch, ids); 
+            
+            for (String id : ids) {
+                redisTemplate.convertAndSend("mib.config.updates", "REFRESH:" + meta.getPrefix() + ":" + id);
+            }
+        }
+    }
+    
+    private void syncData(SyncConfig meta, String columns, Set<String> ids) {
+        // Execute SQL -> Iterate Rows -> Redis Pipeline HMSET
+        // Key Generation: prefix + ":" + row.get(meta.getKeyColumn()).hashCode()
+    }
+}
+5. Consumer Service Implementation (Shared Library)
+Class:ConfigurationCacheService & ConfigurationUpdateListener
+Responsibility: Runs on all microservices. Generic accessor for any master data.
+Generic Retrieval (ConfigurationCacheService)
+@Service
+public class ConfigurationCacheService {
+    // Map<RedisPrefix, Cache<Key, Object>>
+    private final Map<String, Cache<String, Object>> l1CacheRegions = new ConcurrentHashMap<>();
+    /**
+    Generic method to retrieve any configuration object.
+    @param redisPrefix The namespace (e.g. "msg", "policy", "ref:country")
+    @param key The primary key (e.g. "ERR_001", "US")
+    @param type The target class
+     */
+    public <T> T get(String redisPrefix, String key, Class<T> type) {
+        Cache<String, Object> region = getRegionCache(redisPrefix);
+        // 1. L1 Check (Local Memory)
+        Object value = region.getIfPresent(key);
+        if (value != null) return type.cast(value);
+        // 2. L2 Check (Redis)
+        String redisKey = redisPrefix + ":" + key.hashCode();
+        Map<Object, Object> hash = redisTemplate.opsForHash().entries(redisKey);
+        
+        if (hash.isEmpty()) return null;
+        // 3. Deserialize & Cache
+        T obj = objectMapper.convertValue(hash, type);
+        region.put(key, obj);
+        return obj;
+    }
+}
+Granular Invalidation (ConfigurationUpdateListener)
+@Component
+public class ConfigurationUpdateListener implements MessageListener {
+    @Override
+    public void onMessage(Message message, byte[] pattern) {
+        String msg = new String(message.getBody()); // Format: REFRESH:prefix:target
+        String[] parts = msg.split(":");
+        
+        if (parts.length < 3) return;
+        
+        String prefix = parts[1]; // e.g., "msg"
+        String target = parts[2]; // e.g., "ALL" or "ERR_001"
+        Cache<String, Object> region = configService.getRegionCache(prefix);
+        if (region == null) return;
+        if ("ALL".equals(target)) {
+            region.invalidateAll();
+            log.info("Cleared entire L1 region: " + prefix);
+        } else {
+            region.invalidate(target);
+            log.info("Evicted specific key: " + target + " from region: " + prefix);
+        }
+    }
+}
+6. Production Release Strategy (Initial Load)
+Since config_change_log will be empty on Day 1, use this SQL script to trigger the initial population.
+File:V2__initial_cache_load.sql
+-- 1. Register Tables (Security & Master Data)
+INSERT INTO cache_sync_registry (table_name, redis_prefix, key_column, status)
+VALUES 
+('security_policy_config', 'policy', 'uri_pattern', 'ACTIVE'),
+('app_messages', 'msg', 'msg_code', 'ACTIVE'),
+('country_master', 'ref:country', 'iso_code', 'ACTIVE')
+ON CONFLICT DO NOTHING;
+-- 2. Inject 'ALL' Signals to trigger full sync
+INSERT INTO config_change_log (table_name, primary_key, action_type, status, created_at)
+VALUES 
+('security_policy_config', 'ALL', 'REFRESH', 'PENDING', NOW()),
+('app_messages', 'ALL', 'REFRESH', 'PENDING', NOW()),
+('country_master', 'ALL', 'REFRESH', 'PENDING', NOW());
+7. Infrastructure Prerequisites
+Maven Dependencies
+<!-- Distributed Lock -->
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-kubernetes-fabric8-leader</artifactId>
+</dependency>
+<!-- Caching -->
+<dependency>
+    <groupId>com.github.ben-manes.caffeine</groupId>
+    <artifactId>caffeine</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+Kubernetes RBAC (Admin Service Only)
+Required for Leader Election.
+rules:
+ - apiGroups: [""]
+   resources: ["configmaps"]
+   verbs: ["get", "create", "update", "patch"]
+
